@@ -162,7 +162,7 @@ class EncryptedSharedPrefs(
     }
 
     // Inner Editor class that implements SharedPreferences.Editor
-    inner class EncryptedEditor : SharedPreferences.Editor {
+    private inner class EncryptedEditor : SharedPreferences.Editor {
         private val lock = ReentrantLock()
         private val executor = Executors.newSingleThreadExecutor()
         private val pendingOperations = mutableListOf<() -> Unit>()
