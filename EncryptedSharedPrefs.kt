@@ -256,7 +256,8 @@ class EncryptedSharedPrefs(
             lock.lock()
             try {
                 if (shouldClear) {
-                    prefs.edit { clear() }
+                    prefs.edit(commit = true) { clear() }
+                    shouldClear = false
                 }
                 pendingOperations.forEach { it.invoke() }
                 pendingOperations.clear()
