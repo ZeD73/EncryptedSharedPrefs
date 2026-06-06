@@ -62,75 +62,182 @@ class EncryptedSharedPrefs(
     private val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
     private val keyAlias: String = "prefs_master_key_${prefsName.hashCode()}"
 
+    private val keyMap = mutableMapOf<String, String>()
+
+    private val listenerWrappers =
+        mutableMapOf<
+            SharedPreferences.OnSharedPreferenceChangeListener,
+            SharedPreferences.OnSharedPreferenceChangeListener,
+        >()
+
+    private val lock = Any()
+
     // Cache the key for better performance
     private val secretKey: SecretKey by lazy {
         secretKeyProvider.getOrCreateKey(keyAlias)
     }
 
-    private inline fun <reified T> getValue(
-        key: String,
-        defaultValue: T,
-    ): T {
-        val hashedKey = hashKey(key)
-        val encrypted = prefs.getString(hashedKey, null) ?: return defaultValue
+    override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
+        if (listener == null) return
 
-        return try {
-            val decrypted = decrypt(encrypted)
+        synchronized(lock) {
+            if (listenerWrappers.containsKey(listener)) return
 
-            when (T::class) {
-                String::class -> {
-                    String(decrypted, StandardCharsets.UTF_8) as T
+            val wrapped =
+                SharedPreferences.OnSharedPreferenceChangeListener { _, hashedKey ->
+                    val originalKey =
+                        synchronized(lock) {
+                            keyMap[hashedKey] ?: hashedKey
+                        }
+
+                    listener.onSharedPreferenceChanged(this, originalKey)
                 }
 
-                Boolean::class -> {
-                    (decrypted.isNotEmpty() && decrypted[0] == 1.toByte()) as T
-                }
-
-                Int::class -> {
-                    if (decrypted.size >= 4) {
-                        ByteBuffer.wrap(decrypted).int as T
-                    } else {
-                        defaultValue
-                    }
-                }
-
-                Long::class -> {
-                    if (decrypted.size >= 8) {
-                        ByteBuffer.wrap(decrypted).long as T
-                    } else {
-                        defaultValue
-                    }
-                }
-
-                Float::class -> {
-                    if (decrypted.size >= 4) {
-                        ByteBuffer.wrap(decrypted).float as T
-                    } else {
-                        defaultValue
-                    }
-                }
-
-                else -> {
-                    defaultValue
-                }
-            }
-        } catch (_: Exception) {
-            defaultValue
+            listenerWrappers[listener] = wrapped
+            prefs.registerOnSharedPreferenceChangeListener(wrapped)
         }
     }
 
-    override fun getAll(): Map<String, *> = emptyMap<String, Any?>()
+    override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
+        if (listener == null) return
+
+        synchronized(lock) {
+            val wrapped = listenerWrappers.remove(listener)
+            if (wrapped != null) {
+                prefs.unregisterOnSharedPreferenceChangeListener(wrapped)
+            }
+        }
+    }
+
+    private fun rememberKey(key: String): String {
+        val hashedKey = hashKey(key)
+
+        synchronized(lock) {
+            keyMap[hashedKey] = key
+        }
+
+        return hashedKey
+    }
+
+    override fun contains(key: String): Boolean = prefs.contains(hashKey(key))
+
+    override fun edit(): SharedPreferences.Editor = EncryptedEditor()
+
+    private inner class EncryptedEditor : SharedPreferences.Editor {
+        private val editor = prefs.edit()
+
+        override fun putString(
+            key: String,
+            value: String?,
+        ): SharedPreferences.Editor {
+            val hashedKey = rememberKey(key)
+
+            if (value == null) {
+                editor.remove(hashedKey)
+            } else {
+                editor.putString(
+                    hashedKey,
+                    encrypt(value.toByteArray(StandardCharsets.UTF_8)),
+                )
+            }
+
+            return this
+        }
+
+        override fun putStringSet(
+            key: String,
+            values: MutableSet<String>?,
+        ): SharedPreferences.Editor {
+            val hashedKey = rememberKey(key)
+
+            if (values == null) {
+                editor.remove(hashedKey)
+            } else {
+                val jsonArray = JSONArray()
+                values.forEach { jsonArray.put(it) }
+
+                editor.putString(
+                    hashedKey,
+                    encrypt(jsonArray.toString().toByteArray(StandardCharsets.UTF_8)),
+                )
+            }
+
+            return this
+        }
+
+        override fun putInt(
+            key: String,
+            value: Int,
+        ): SharedPreferences.Editor {
+            editor.putString(
+                rememberKey(key),
+                encrypt(ByteBuffer.allocate(4).putInt(value).array()),
+            )
+            return this
+        }
+
+        override fun putLong(
+            key: String,
+            value: Long,
+        ): SharedPreferences.Editor {
+            editor.putString(
+                rememberKey(key),
+                encrypt(ByteBuffer.allocate(8).putLong(value).array()),
+            )
+            return this
+        }
+
+        override fun putFloat(
+            key: String,
+            value: Float,
+        ): SharedPreferences.Editor {
+            editor.putString(
+                rememberKey(key),
+                encrypt(ByteBuffer.allocate(4).putFloat(value).array()),
+            )
+            return this
+        }
+
+        override fun putBoolean(
+            key: String,
+            value: Boolean,
+        ): SharedPreferences.Editor {
+            editor.putString(
+                rememberKey(key),
+                encrypt(byteArrayOf(if (value) 1 else 0)),
+            )
+            return this
+        }
+
+        override fun remove(key: String): SharedPreferences.Editor {
+            editor.remove(rememberKey(key))
+            return this
+        }
+
+        override fun clear(): SharedPreferences.Editor {
+            synchronized(lock) {
+                keyMap.clear()
+            }
+
+            editor.clear()
+            return this
+        }
+
+        override fun commit(): Boolean = editor.commit()
+
+        override fun apply() {
+            editor.apply()
+        }
+    }
 
     override fun getString(
         key: String,
         defValue: String?,
     ): String? {
-        val hashedKey = hashKey(key)
-        val encrypted = prefs.getString(hashedKey, null) ?: return defValue
+        val encrypted = prefs.getString(hashKey(key), null) ?: return defValue
 
         return try {
-            val decrypted = decrypt(encrypted)
-            String(decrypted, StandardCharsets.UTF_8)
+            String(decrypt(encrypted), StandardCharsets.UTF_8)
         } catch (_: Exception) {
             defValue
         }
@@ -140,19 +247,17 @@ class EncryptedSharedPrefs(
         key: String,
         defValues: MutableSet<String>?,
     ): MutableSet<String>? {
-        val hashedKey = hashKey(key)
-        val encrypted = prefs.getString(hashedKey, null) ?: return defValues
+        val encrypted = prefs.getString(hashKey(key), null) ?: return defValues
 
         return try {
-            val decrypted = decrypt(encrypted)
-            val jsonArray = JSONArray(String(decrypted, StandardCharsets.UTF_8))
-            val set = mutableSetOf<String>()
+            val jsonArray = JSONArray(String(decrypt(encrypted), StandardCharsets.UTF_8))
+            val result = mutableSetOf<String>()
 
             for (i in 0 until jsonArray.length()) {
-                set.add(jsonArray.getString(i))
+                result.add(jsonArray.getString(i))
             }
 
-            set
+            result
         } catch (_: Exception) {
             defValues
         }
@@ -178,111 +283,44 @@ class EncryptedSharedPrefs(
         defValue: Boolean,
     ): Boolean = getValue(key, defValue)
 
-    override fun contains(key: String): Boolean = prefs.contains(hashKey(key))
+    override fun getAll(): Map<String, *> = emptyMap<String, Any?>()
 
-    override fun edit(): SharedPreferences.Editor = EncryptedEditor()
+    private inline fun <reified T> getValue(
+        key: String,
+        defaultValue: T,
+    ): T {
+        val encrypted = prefs.getString(hashKey(key), null) ?: return defaultValue
 
-    override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
-        // Note: Change listeners receives the hashed key, not the original key
-        prefs.registerOnSharedPreferenceChangeListener(listener)
-    }
+        return try {
+            val decrypted = decrypt(encrypted)
 
-    override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {
-        prefs.unregisterOnSharedPreferenceChangeListener(listener)
-    }
+            when (T::class) {
+                Boolean::class -> {
+                    (decrypted.isNotEmpty() && decrypted[0] == 1.toByte()) as T
+                }
 
-    private inner class EncryptedEditor : SharedPreferences.Editor {
-        private val editor: SharedPreferences.Editor = prefs.edit()
+                Int::class -> {
+                    if (decrypted.size >= 4) ByteBuffer.wrap(decrypted).int as T else defaultValue
+                }
 
-        override fun putString(
-            key: String,
-            value: String?,
-        ): SharedPreferences.Editor {
-            val hashedKey = hashKey(key)
+                Long::class -> {
+                    if (decrypted.size >= 8) ByteBuffer.wrap(decrypted).long as T else defaultValue
+                }
 
-            if (value == null) {
-                editor.remove(hashedKey)
-            } else {
-                val encrypted = encrypt(value.toByteArray(StandardCharsets.UTF_8))
-                editor.putString(hashedKey, encrypted)
+                Float::class -> {
+                    if (decrypted.size >= 4) ByteBuffer.wrap(decrypted).float as T else defaultValue
+                }
+
+                String::class -> {
+                    String(decrypted, StandardCharsets.UTF_8) as T
+                }
+
+                else -> {
+                    defaultValue
+                }
             }
-
-            return this
-        }
-
-        override fun putStringSet(
-            key: String,
-            values: MutableSet<String>?,
-        ): SharedPreferences.Editor {
-            val hashedKey = hashKey(key)
-
-            if (values == null) {
-                editor.remove(hashedKey)
-            } else {
-                val jsonArray = JSONArray()
-                values.forEach { jsonArray.put(it) }
-
-                val encrypted =
-                    encrypt(
-                        jsonArray.toString().toByteArray(StandardCharsets.UTF_8),
-                    )
-
-                editor.putString(hashedKey, encrypted)
-            }
-
-            return this
-        }
-
-        override fun putInt(
-            key: String,
-            value: Int,
-        ): SharedPreferences.Editor {
-            val encrypted = encrypt(ByteBuffer.allocate(4).putInt(value).array())
-            editor.putString(hashKey(key), encrypted)
-            return this
-        }
-
-        override fun putLong(
-            key: String,
-            value: Long,
-        ): SharedPreferences.Editor {
-            val encrypted = encrypt(ByteBuffer.allocate(8).putLong(value).array())
-            editor.putString(hashKey(key), encrypted)
-            return this
-        }
-
-        override fun putFloat(
-            key: String,
-            value: Float,
-        ): SharedPreferences.Editor {
-            val encrypted = encrypt(ByteBuffer.allocate(4).putFloat(value).array())
-            editor.putString(hashKey(key), encrypted)
-            return this
-        }
-
-        override fun putBoolean(
-            key: String,
-            value: Boolean,
-        ): SharedPreferences.Editor {
-            val encrypted = encrypt(byteArrayOf(if (value) 1 else 0))
-            editor.putString(hashKey(key), encrypted)
-            return this
-        }
-
-        override fun remove(key: String): SharedPreferences.Editor {
-            editor.remove(hashKey(key))
-            return this
-        }
-
-        override fun clear(): SharedPreferences.Editor {
-            editor.clear()
-            return this
-        }
-
-        override fun commit(): Boolean = editor.commit()
-
-        override fun apply() {
-            editor.apply()
+        } catch (_: Exception) {
+            defaultValue
         }
     }
 

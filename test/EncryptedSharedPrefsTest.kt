@@ -1,7 +1,10 @@
 package com.your.package
 
 import android.content.Context
+import android.content.SharedPreferences
+import androidx.core.content.edit
 import androidx.test.core.app.ApplicationProvider
+import junit.framework.TestCase.assertSame
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -312,6 +315,33 @@ class EncryptedSharedPrefsTest {
             .commit()
 
         assertTrue(prefs.all.isEmpty())
+    }
+
+    @Test
+    fun `change listener receives wrapper prefs original key and decrypted value`() {
+        val testKey = "test_key"
+        val testValue = "test"
+
+        var keyFromCallback: String? = null
+        var valueFromCallback: String? = null
+        var prefsFromCallback: SharedPreferences? = null
+
+        prefs.registerOnSharedPreferenceChangeListener { preferences, key ->
+            prefsFromCallback = preferences
+            keyFromCallback = key
+            valueFromCallback = preferences.getString(key, null)
+        }
+
+        prefs.edit(commit = true) {
+            putString(testKey, testValue)
+        }
+
+        val valueFromReadBack = prefs.getString(testKey, null)
+
+        assertSame(prefs, prefsFromCallback)
+        assertEquals(testKey, keyFromCallback)
+        assertEquals(testValue, valueFromReadBack)
+        assertEquals(testValue, valueFromCallback)
     }
 
     class InMemorySecretKeyProvider : SecretKeyProvider {
